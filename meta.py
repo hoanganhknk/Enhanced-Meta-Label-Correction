@@ -189,8 +189,10 @@ def meta_loss(jvp, pseudo_target_s, eta):
     meta_loss = eta * batch_dot_product.mean() # Batch dot product
     return meta_loss
 
+import torch
+import torch.nn.functional as F
+
 def retain_conf_loss(enhancer, t_repr_g, t_logit_g, target_g, rank, num_classes, mode='adverserial'):
-    # Label retaining binary loss
     if mode == 'random':
         target_g_fake = torch.clone(target_g)
         target_g_fake[::2] = torch.randint_like(target_g_fake[::2], high=num_classes).to(rank)
@@ -201,9 +203,18 @@ def retain_conf_loss(enhancer, t_repr_g, t_logit_g, target_g, rank, num_classes,
         target_g_fake[::2] = adverserial_labels[::2].to(rank)
     else:
         raise NotImplementedError
+
     target_g_mask = torch.eq(target_g_fake, target_g).type(torch.float).to(rank)
+
     retain_conf_g = enhancer(t_repr_g, target_g_fake)
-    retain_conf_loss = F.binary_cross_entropy(retain_conf_g, target_g_mask.reshape_as(retain_conf_g))
+
+    retain_conf_g = torch.nan_to_num(retain_conf_g, nan=0.5) 
+    retain_conf_g = torch.clamp(retain_conf_g, 1e-6, 1 - 1e-6)
+
+    retain_conf_loss = F.binary_cross_entropy(
+        retain_conf_g,
+        target_g_mask.reshape_as(retain_conf_g)
+    )
     return retain_conf_loss
 
 def jacobian_vector_product(model, inputs, vector, method='forward'):
