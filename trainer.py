@@ -7,7 +7,18 @@ from tqdm import tqdm
 
 import torch
 import torch.distributed as dist
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    # Dummy SummaryWriter nếu tensorboard/protobuf lỗi (như trên Kaggle)
+    class SummaryWriter:
+        def __init__(self, *args, **kwargs):
+            pass
+        def add_scalar(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
+
 
 class Trainer:
 
@@ -27,6 +38,9 @@ class Trainer:
 
         if rank == 0:
             self.writer = SummaryWriter(args.logdir + '/' + exp_id)
+        else:
+            self.writer = None
+
 
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
