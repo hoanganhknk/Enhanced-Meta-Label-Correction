@@ -34,7 +34,7 @@ parser.add_argument('--embedding_dim', type=int, default=512, help='Feature extr
 parser.add_argument('--label_embedding_dim', type=int, default=128, help='Label embedding dim')
 parser.add_argument('--mlp_hidden_dim', type=int, default=128, help='MLP hidden layer units')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum for optimizer')
-parser.add_argument('--main_lr', default=0.1, type=float, help='lr for main net')
+parser.add_argument('--main_lr', default=0.02, type=float, help='lr for main net')
 parser.add_argument('--meta_lr', default=2e-2, type=float, help='lr for meta net')
 parser.add_argument('--wdecay', default=5e-4, type=float, help='weight decay')
 parser.add_argument('--gradient_steps', default=5, type=int, help='Number of look-ahead gradient steps for meta-gradient')

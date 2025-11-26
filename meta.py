@@ -193,7 +193,6 @@ import torch
 import torch.nn.functional as F
 
 def retain_conf_loss(enhancer, t_repr_g, t_logit_g, target_g, rank, num_classes, mode='adverserial'):
-    # Label retaining binary loss
     if mode == 'random':
         target_g_fake = torch.clone(target_g)
         target_g_fake[::2] = torch.randint_like(target_g_fake[::2], high=num_classes).to(rank)
@@ -206,26 +205,13 @@ def retain_conf_loss(enhancer, t_repr_g, t_logit_g, target_g, rank, num_classes,
         raise NotImplementedError
 
     target_g_mask = torch.eq(target_g_fake, target_g).type(torch.float).to(rank)
-
-    retain_conf_g = enhancer(t_repr_g, target_g_fake) 
-    target_g_mask = target_g_mask.reshape_as(retain_conf_g)
-
-
-    valid = torch.isfinite(retain_conf_g)
-    valid = valid & (retain_conf_g >= 0.0) & (retain_conf_g <= 1.0)
-
-    if valid.sum() == 0:
-        return (retain_conf_g * 0.0).sum()
-
-    retain_conf_g_valid = retain_conf_g[valid]
-    target_g_mask_valid = target_g_mask[valid]
-
+    retain_conf_g = enhancer(t_repr_g, target_g_fake)
     retain_conf_loss = F.binary_cross_entropy(
-        retain_conf_g_valid,
-        target_g_mask_valid
+        retain_conf_g,
+        target_g_mask.reshape_as(retain_conf_g)
     )
-
     return retain_conf_loss
+
 
 
 def jacobian_vector_product(model, inputs, vector, method='forward'):

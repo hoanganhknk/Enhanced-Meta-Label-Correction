@@ -10,7 +10,6 @@ import torch.distributed as dist
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
-    # Dummy SummaryWriter nếu tensorboard/protobuf lỗi (như trên Kaggle)
     class SummaryWriter:
         def __init__(self, *args, **kwargs):
             pass
