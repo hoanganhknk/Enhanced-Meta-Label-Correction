@@ -21,7 +21,8 @@ parser.add_argument('--data_seed', type=int, default=0)
 parser.add_argument('--runid', default='clothing1m_run_best', type=str)
 parser.add_argument('--data_path', default='data/', type=str, help='Root for the datasets.')
 parser.add_argument('--logdir', type=str, default='runs', help='Log folder.')
-parser.add_argument('--ssl_path', type=str, help='SSL pretrained model path.') # Required
+parser.add_argument('--ssl_path', type=str, default='', help='(Optional) SSL pretrained model path.')
+
 
 # Training
 parser.add_argument('--epochs', '-e', type=int, default=15, help='Number of epochs to train.')
@@ -70,13 +71,16 @@ def set_logging(rank):
 # //////////////////////// defining model ////////////////////////
 
 def build_models(rank, dataset, num_classes):
-    args.embedding_dim = 512 if dataset == 'cifar10' else 2048
-    model_fn = generalized_resnet34 if dataset == 'cifar10' else generalized_resnet50
-    main_net = model_fn(num_classes, args, ssl=True)
-    meta_backbone = model_fn(num_classes, args, ssl=True)
+    args.embedding_dim = 64
+    model_fn = generalized_resnet32
+
+    main_net = model_fn(num_classes, args, ssl=False)
+
+    meta_backbone = model_fn(num_classes, args, ssl=False)
 
     meta_net = ResNetFeatures(meta_backbone)
-    enhancer = TeacherEnhancer(num_classes, args.embedding_dim, args.label_embedding_dim, args.mlp_hidden_dim)
+    enhancer = TeacherEnhancer(num_classes, args.embedding_dim,
+                               args.label_embedding_dim, args.mlp_hidden_dim)
 
     main_net = main_net.to(rank)
     main_net = DDP(main_net, device_ids=[rank])

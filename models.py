@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
-from resnet import PreResNet18, ResNet50, ResNet34
+from resnet import PreResNet18, ResNet50, ResNet34, ResNet32
+
 
 def generalized_resnet50(num_classes, args, ssl=False):
     model = ResNet50()
@@ -11,6 +12,13 @@ def generalized_resnet50(num_classes, args, ssl=False):
         sd = {k.removeprefix('encoder.module.') : v for k,v in sd.items()}
         model.load_state_dict(sd, strict=False)
     model.fc = nn.Linear(args.embedding_dim, num_classes)
+    return model
+def generalized_resnet32(num_classes, args, ssl=False):
+    """
+    ResNet32 CIFAR dont pretrain by SSL method.
+    Feature dim = 64.
+    """
+    model = ResNet32(num_classes)
     return model
 
 def generalized_resnet50_clothing(num_classes, args):
