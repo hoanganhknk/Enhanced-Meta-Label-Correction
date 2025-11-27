@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
 
-from resnet import resnet32 
+from resnet import ResNet32
 
 
 class SimCLR(nn.Module):
@@ -107,7 +107,7 @@ def pretrain_ssl(args):
     loader = build_dataloader(args.dataset, args.data_path, args.bs, args.num_workers)
 
     num_classes = 10 if args.dataset == 'cifar10' else 100
-    base_encoder = resnet32(num_classes=num_classes)   # CIFAR ResNet32 backbone
+    base_encoder = ResNet32(num_classes=num_classes)   # CIFAR ResNet32 backbone
     model = SimCLR(base_encoder, proj_dim=args.proj_dim).to(device)
 
     optimizer = torch.optim.SGD(
