@@ -15,11 +15,26 @@ def generalized_resnet50(num_classes, args, ssl=False):
     return model
 def generalized_resnet32(num_classes, args, ssl=False):
     """
-    ResNet32 CIFAR dont pretrain by SSL method.
-    Feature dim = 64.
+    ResNet32 cho CIFAR với option load SSL pretrain từ args.ssl_path.
     """
-    model = ResNet32(num_classes)
+    model = resnet32(num_classes=num_classes)
+
+    if ssl and getattr(args, "ssl_path", None):
+        sd = torch.load(args.ssl_path, map_location="cpu")["model"]
+        cleaned = {}
+        for k, v in sd.items():
+            if k.startswith("encoder.module."):
+                new_key = k[len("encoder.module."):]
+            elif k.startswith("encoder."):
+                new_key = k[len("encoder."):]
+            else:
+                new_key = k
+            cleaned[new_key] = v
+
+        model.load_state_dict(cleaned, strict=False)
+
     return model
+
 
 def generalized_resnet50_clothing(num_classes, args):
     model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)

@@ -71,16 +71,18 @@ def set_logging(rank):
 # //////////////////////// defining model ////////////////////////
 
 def build_models(rank, dataset, num_classes):
-    args.embedding_dim = 64
-    model_fn = generalized_resnet32
+    args.embedding_dim = 64  
 
-    main_net = model_fn(num_classes, args, ssl=False)
+    use_ssl = args.ssl_path is not None and args.ssl_path != ""
 
-    meta_backbone = model_fn(num_classes, args, ssl=False)
+    main_net = generalized_resnet32(num_classes, args, ssl=use_ssl)
+    meta_backbone = generalized_resnet32(num_classes, args, ssl=use_ssl)
 
     meta_net = ResNetFeatures(meta_backbone)
-    enhancer = TeacherEnhancer(num_classes, args.embedding_dim,
-                               args.label_embedding_dim, args.mlp_hidden_dim)
+    enhancer = TeacherEnhancer(num_classes,
+                               args.embedding_dim,
+                               args.label_embedding_dim,
+                               args.mlp_hidden_dim)
 
     main_net = main_net.to(rank)
     main_net = DDP(main_net, device_ids=[rank])
@@ -89,8 +91,7 @@ def build_models(rank, dataset, num_classes):
     meta_net = DDP(meta_net, device_ids=[rank])
 
     enhancer = enhancer.to(rank)
-    enhancer = DDP(enhancer, device_ids=[rank])
-    
+
     return main_net, meta_net, enhancer
 
 # //////////////////////// run experiments ////////////////////////
