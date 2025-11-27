@@ -193,19 +193,37 @@ import torch
 import torch.nn.functional as F
 
 def retain_conf_loss(enhancer, t_repr_g, t_logit_g, target_g, rank, num_classes, mode='adverserial'):
+    # Label retaining binary loss
     if mode == 'random':
         target_g_fake = torch.clone(target_g)
         target_g_fake[::2] = torch.randint_like(target_g_fake[::2], high=num_classes).to(rank)
     elif mode == 'adverserial':
         top_two_preds = torch.topk(t_logit_g, 2, dim=1, sorted=True)[1]
-        adverserial_labels = torch.where(top_two_preds[:,0] != target_g, top_two_preds[:,0], top_two_preds[:,1])
+        adverserial_labels = torch.where(
+            top_two_preds[:, 0] != target_g,
+            top_two_preds[:, 0],
+            top_two_preds[:, 1]
+        )
         target_g_fake = torch.clone(target_g)
         target_g_fake[::2] = adverserial_labels[::2].to(rank)
     else:
         raise NotImplementedError
 
     target_g_mask = torch.eq(target_g_fake, target_g).type(torch.float).to(rank)
+
+
     retain_conf_g = enhancer(t_repr_g, target_g_fake)
+
+    retain_conf_g = torch.nan_to_num(
+        retain_conf_g,
+        nan=0.5,
+        posinf=1.0,
+        neginf=0.0,
+    )
+
+    eps = 1e-6
+    retain_conf_g = retain_conf_g.clamp(eps, 1 - eps)
+
     retain_conf_loss = F.binary_cross_entropy(
         retain_conf_g,
         target_g_mask.reshape_as(retain_conf_g)
