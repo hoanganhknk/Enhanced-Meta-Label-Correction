@@ -17,7 +17,7 @@ def generalized_resnet32(num_classes, args, ssl=False):
     """
     ResNet32 cho CIFAR với option load SSL pretrain từ args.ssl_path.
     """
-    model = resnet32(num_classes=num_classes)
+    model = ResNet32(num_classes=num_classes)
 
     if ssl and getattr(args, "ssl_path", None):
         sd = torch.load(args.ssl_path, map_location="cpu")["model"]
