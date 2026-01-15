@@ -72,14 +72,17 @@ class DataIterator(object):
         self.loader = dataloader
         self.iterator = iter(self.loader)
 
+    def __iter__(self):
+        return self
+
     def __next__(self):
         try:
             x, y = next(self.iterator)
         except StopIteration:
             self.iterator = iter(self.loader)
             x, y = next(self.iterator)
-
         return x, y
+
 def accuracy(output, target, topk=(1,)):
     """Compute top-k accuracy (returns list of percentages)."""
     with torch.no_grad():
