@@ -1,8 +1,12 @@
-import pickle
-import argparse
 import os
 
+# Suppress TF/XLA noisy logs if something imports tensorflow indirectly
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+import pickle
+import argparse
 import torch.multiprocessing as mp
+import torch.distributed as dist
 from torch.distributed import destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -12,16 +16,22 @@ from models import *
 from meta_models import *
 from CIFAR.data_helper_cifar import prepare_data
 
+
 parser = argparse.ArgumentParser(description='EMLC Training Framework')
 
 # General and paths
-parser.add_argument('--dataset', type=str, choices=['cifar10', 'cifar100']) # Required
+parser.add_argument('--dataset', type=str, choices=['cifar10', 'cifar100'])  # Required
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--data_seed', type=int, default=0)
 parser.add_argument('--runid', default='clothing1m_run_best', type=str)
 parser.add_argument('--data_path', default='data/', type=str, help='Root for the datasets.')
 parser.add_argument('--logdir', type=str, default='runs', help='Log folder.')
+
+# SSL path optional now (we will train from scratch regardless)
 parser.add_argument('--ssl_path', type=str, default=None, help='SSL pretrained model path (optional).')
+
+# Optional: disable tensorboard to keep logs clean
+parser.add_argument('--no_tb', action='store_true', help='Disable TensorBoard logging (clean console output).')
 
 # Training
 parser.add_argument('--epochs', '-e', type=int, default=15, help='Number of epochs to train.')
@@ -43,7 +53,7 @@ parser.add_argument('--sched_gamma', default=0.1, type=float, help='Multiply LR 
 # Noise injection
 parser.add_argument('--corruption_type', type=str, choices=['unif', 'flip'])
 parser.add_argument('--corruption_level', type=float, help='Corruption level')
-parser.add_argument('--gold_fraction', default='0.02', type=float, help='Gold fraction')
+parser.add_argument('--gold_fraction', default=0.02, type=float, help='Gold fraction')
 
 # Hardware
 parser.add_argument('--prefetch', type=int, default=2, help='Pre-fetching threads.')
@@ -52,23 +62,32 @@ parser.add_argument('--n_gpus', default=1, type=int)
 
 args = parser.parse_args()
 
-# //////////////// set logging and model outputs /////////////////
+
 def set_logging(rank):
-    filename = '_'.join([args.dataset, str(args.corruption_level), args.corruption_type, str(args.gold_fraction),
-                         args.runid, str(args.epochs), str(args.seed), str(args.data_seed)])
-    if not os.path.isdir('logs'):
-        os.mkdir('logs')
+    filename = '_'.join([
+        args.dataset,
+        str(args.corruption_level),
+        args.corruption_type,
+        args.runid,
+        str(args.epochs),
+        str(args.seed),
+        str(args.data_seed),
+    ])
+
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('out', exist_ok=True)
+
     logfile = 'logs/' + filename + '.log'
     logger = get_logger(logfile, rank)
 
-    if not os.path.isdir('models'):
-        os.mkdir('models')
-
-    logger.info('Arguments: ')
-    for arg in vars(args):
-        logger.info(f'{arg}: {getattr(args, arg)}')
+    logger.info('Arguments:')
+    for k, v in vars(args).items():
+        logger.info(f'{k}: {v}')
     logger.info('')
+
     return logger
+
 
 def build_models(rank, dataset, num_classes):
     args.embedding_dim = 512 if dataset == 'cifar10' else 2048
@@ -92,46 +111,64 @@ def build_models(rank, dataset, num_classes):
 
     return main_net, meta_net, enhancer
 
-# //////////////////////// run experiments ////////////////////////
+
 def run(rank):
     ddp_setup(rank, world_size=args.n_gpus, min_rank=args.gpuid)
     logger = set_logging(rank)
-    filename = '_'.join([args.dataset, args.corruption_type, str(args.corruption_level),
-                         str(args.gold_fraction), args.runid, str(args.epochs),
-                         str(args.seed), str(args.data_seed)])
+
+    filename = '_'.join([
+        args.dataset,
+        args.corruption_type,
+        args.runid,
+        str(args.epochs),
+        str(args.seed),
+        str(args.data_seed),
+    ])
     exp_id = filename
 
-    results = {}
+    try:
+        assert 0 <= args.gold_fraction <= 1, 'Wrong gold fraction!'
+        assert 0 <= args.corruption_level <= 1, 'Wrong noise level!'
 
-    assert args.gold_fraction >= 0 and args.gold_fraction <= 1, 'Wrong gold fraction!'
-    assert args.corruption_level >= 0 and args.corruption_level <= 1, 'Wrong noise level!'
+        gold_loader, silver_loader, valid_loader, test_loader, num_classes = prepare_data(
+            args.gold_fraction, args.corruption_level, args
+        )
 
-    # Be robust to prepare_data() returning extra values
-    out = prepare_data(args.gold_fraction, args.corruption_level, args)
-    gold_loader, silver_loader, valid_loader, test_loader, num_classes, *rest = out
+        main_net, meta_net, enhancer = build_models(rank, args.dataset, num_classes)
 
-    main_net, meta_net, enhancer = build_models(rank, args.dataset, num_classes)
+        trainer = Trainer(
+            rank, args, main_net, meta_net, enhancer,
+            gold_loader, silver_loader, valid_loader, test_loader,
+            num_classes, logger, exp_id
+        )
+        trainer.train()
+        test_acc = trainer.final_eval()
 
-    trainer = Trainer(rank, args, main_net, meta_net, enhancer,
-                      gold_loader, silver_loader, valid_loader, test_loader,
-                      num_classes, logger, exp_id)
-    trainer.train()
-    test_acc = trainer.final_eval()
+        if rank == 0:
+            results = {'method': test_acc}
+            logger.info(' '.join([
+                'Gold fraction:', str(args.gold_fraction),
+                '| Corruption level:', str(args.corruption_level),
+                '| Method acc:', str(results['method'])
+            ]))
+            logger.info('')
+            with open('out/' + filename, 'wb') as f:
+                pickle.dump(results, f)
 
-    results['method'] = test_acc
-    logger.info(' '.join(['Gold fraction:', str(args.gold_fraction), '| Corruption level:', str(args.corruption_level),
-                          '| Method acc:', str(results['method'])]))
-    logger.info('')
+        logger.info("Dumped results_ours in file: " + filename)
 
-    if rank == 0:
-        if not os.path.isdir('out'):
-            os.mkdir('out')
-        with open('out/' + filename, 'wb') as file:
-            pickle.dump(results, file)
-    logger.info("Dumped results_ours in file: " + filename)
-    destroy_process_group()
+    finally:
+        # Always clean up DDP
+        if dist.is_available() and dist.is_initialized():
+            destroy_process_group()
+
 
 if __name__ == "__main__":
     gpus = range(args.gpuid, args.gpuid + args.n_gpus)
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in gpus)
-    mp.spawn(run, nprocs=args.n_gpus)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpus)
+
+    # ✅ Avoid mp.spawn for single GPU to prevent duplicated noisy logs
+    if args.n_gpus == 1:
+        run(0)
+    else:
+        mp.spawn(run, nprocs=args.n_gpus)
