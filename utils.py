@@ -80,3 +80,34 @@ class DataIterator(object):
             x, y = next(self.iterator)
 
         return x, y
+def accuracy(output, target, topk=(1,)):
+    """Compute top-k accuracy (returns list of percentages)."""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+def log_losses(writer, epoch, loss_g, loss_s, t_loss):
+    """TensorBoard logging for losses."""
+    if writer is None:
+        return
+    writer.add_scalar('loss/loss_g', loss_g, epoch)
+    writer.add_scalar('loss/loss_s', loss_s, epoch)
+    writer.add_scalar('loss/t_loss', t_loss, epoch)
+
+
+def log_acc(writer, epoch, acc, prefix='val/main'):
+    """TensorBoard logging for accuracy."""
+    if writer is None:
+        return
+    writer.add_scalar(f'acc/{prefix}', acc, epoch)
