@@ -1,17 +1,18 @@
+import os
 import copy
-import torch
-from utils import tocuda, evaluate
 import numpy as np
-from meta import teacher_backward, teacher_backward_ms
-from tqdm import tqdm
-
 import torch
-import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-class Trainer:
+from utils import tocuda, accuracy, log_losses, log_acc
+from meta import teacher_backward, teacher_backward_ms
 
-    def __init__(self, rank, args, main_net, meta_net, enhancer, gold_loader, silver_loader, valid_loader, test_loader, num_classes, logger, exp_id=None):
+
+class Trainer:
+    def __init__(self, rank, args, main_net, meta_net, enhancer,
+                 gold_loader, silver_loader, valid_loader, test_loader,
+                 num_classes, logger, exp_id=None):
         self.rank = rank
         self.args = args
         self.main_net = main_net
@@ -32,24 +33,32 @@ class Trainer:
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed(args.seed)
 
+        self.best_val = 0
+        self.best_main_state = None
+        self.best_meta_state = None
+        self.best_enhancer_state = None
+
         self._setup_training()
 
     def _setup_training(self):
         ''' Fetch optimizers and schedulers for
           training the student, teacher and its enhancer'''
         args = self.args
-        main_params = self.main_net.parameters() 
+        main_params = self.main_net.parameters()
         meta_params = self.meta_net.parameters()
         enhancer_params = self.enhancer.parameters()
 
         self.main_opt = torch.optim.SGD(main_params, lr=args.main_lr, weight_decay=args.wdecay, momentum=args.momentum)
-        
+
         self.meta_opt = torch.optim.SGD(meta_params, lr=args.meta_lr,
-                                    weight_decay=args.wdecay)
+                                        weight_decay=args.wdecay)
         self.enhancer_opt = torch.optim.SGD(enhancer_params, lr=args.meta_lr,
-                                    weight_decay=args.wdecay)
+                                            weight_decay=args.wdecay)
 
         milestones = args.sched_milestones
+        if isinstance(milestones, str):
+            # Accept formats like '20', '20,30', or '20 30'
+            milestones = [int(x) for x in milestones.replace(',', ' ').split() if x.strip()]
         gamma = args.sched_gamma
         self.main_schdlr = torch.optim.lr_scheduler.MultiStepLR(self.main_opt, milestones=milestones, gamma=gamma)
         self.meta_schdlr = torch.optim.lr_scheduler.MultiStepLR(self.meta_opt, milestones=milestones, gamma=gamma)
@@ -63,119 +72,103 @@ class Trainer:
         # bi-level optimization stage
         eta = self.main_schdlr.get_last_lr()[0]
         kwargs = {'rank': self.rank, 'args': self.args,
-                'main_net': self.main_net, 'main_opt': self.main_opt,
-                'teacher': self.meta_net, 'teacher_opt': self.meta_opt,
-                'enhancer': self.enhancer, 'enhancer_opt': self.enhancer_opt,
-                'data_s': data_s, 'target_s': target_s,
-                'data_g': data_g, 'target_g': target_g,
-                'eta': eta, 'num_classes': self.num_classes}
+                  'main_net': self.main_net, 'main_opt': self.main_opt,
+                  'teacher': self.meta_net, 'teacher_opt': self.meta_opt,
+                  'enhancer': self.enhancer, 'enhancer_opt': self.enhancer_opt,
+                  'data_s': data_s, 'target_s': target_s,
+                  'data_g': data_g, 'target_g': target_g,
+                  'eta': eta, 'num_classes': self.num_classes}
         teacher_backward_fn = teacher_backward if self.args.gradient_steps == 1 else teacher_backward_ms
         loss_g, loss_s, t_loss = teacher_backward_fn(**kwargs)
 
-        # Update metrics
-        if self.args.steps % self.args.every == 0:
-            for metric, name in zip([loss_g, loss_s, t_loss], ['loss_g', 'loss_s', 't_loss']):
-                dist.reduce(metric, dst=0)
-                metric /= self.args.n_gpus
-                if self.rank == 0:
-                    self.writer.add_scalar(f'train/{name}', metric.item(), self.args.steps)
+        return loss_g.item(), loss_s.item(), t_loss.item()
 
-            if self.rank == 0:
-                main_lr = self.main_schdlr.get_last_lr()[0]
-                self.writer.add_scalar('train/main_lr', main_lr, self.args.steps)
-                self.writer.add_scalar('train/gradient_steps', self.args.gradient_steps, self.args.steps)
+    def _training_epoch(self, epoch):
+        self.main_net.train()
+        self.meta_net.train()
+        self.enhancer.train()
+
+        losses_g = []
+        losses_s = []
+        losses_t = []
+
+        gold_iter = iter(self.gold_loader)
+        for i, (data_s, target_s) in enumerate(self.silver_loader):
+            try:
+                data_g, target_g = next(gold_iter)
+            except StopIteration:
+                gold_iter = iter(self.gold_loader)
+                data_g, target_g = next(gold_iter)
+
+            loss_g, loss_s, t_loss = self._training_iter(data_s, target_s, data_g, target_g)
+            losses_g.append(loss_g)
+            losses_s.append(loss_s)
+            losses_t.append(t_loss)
+
+            if self.rank == 0 and (i + 1) % 10 == 0:
+                self.logger.info(f'Epoch [{epoch+1}/{self.args.epochs}] Iter [{i+1}/{len(self.silver_loader)}] '
+                                 f'loss_g: {loss_g:.4f} loss_s: {loss_s:.4f} t_loss: {t_loss:.4f}')
+
+        self.main_schdlr.step()
+        self.meta_schdlr.step()
+        self.enhancer_schdlr.step()
+
+        return float(np.mean(losses_g)), float(np.mean(losses_s)), float(np.mean(losses_t))
+
+    @torch.no_grad()
+    def _eval(self, loader, net, epoch=None, prefix='val'):
+        net.eval()
+        total_acc = 0
+        total = 0
+        total_loss = 0
+
+        for data, target in loader:
+            data, target = tocuda(self.rank, data), tocuda(self.rank, target)
+            outputs = net(data)
+            loss = F.cross_entropy(outputs, target)
+            acc1 = accuracy(outputs, target, topk=(1,))[0]
+
+            bs = data.size(0)
+            total += bs
+            total_loss += loss.item() * bs
+            total_acc += acc1.item() * bs
+
+        avg_loss = total_loss / total
+        avg_acc = total_acc / total
+
+        if self.rank == 0 and epoch is not None:
+            self.logger.info(f'[{prefix}] Epoch {epoch+1}: loss={avg_loss:.4f}, acc={avg_acc:.2f}')
+
+        return avg_loss, avg_acc
 
     def train(self):
-        ''' Training loop '''
-        self.meta_net.train()
-        self.main_net.train()
-
-        if self.rank == 0:
-            self.best_val_main = 0
-        self.epoch = 0
-
         for epoch in range(self.args.epochs):
-            self.logger.info('Epoch %d:' % epoch)
-            self.args.steps = 0
-            all_data_s, all_target_s = [], []
-            self.epoch += 1
+            loss_g, loss_s, t_loss = self._training_epoch(epoch)
 
             if self.rank == 0:
-                self.pbar = tqdm(total=len(self.silver_loader.dataset))
+                log_losses(self.writer, epoch, loss_g, loss_s, t_loss)
 
-            for *data_s, target_s in self.silver_loader:
-                
-                # Setup training iteration 
-                self.args.steps += 1
-                if type(data_s) is list and len(data_s) == 1:
-                    data_s = data_s[0]
-                *data_g, target_g = next(self.gold_loader)
-                if self.args.gradient_steps > 1:
-                    all_data_s.append(data_s)
-                    all_target_s.append(target_s)
-                
-                # Actual training step
-                if self.args.steps % self.args.gradient_steps == 0:
-                    if self.args.gradient_steps == 1:
-                        self._training_iter(data_s, target_s, data_g, target_g)
-                    else:
-                        data_s = torch.cat(all_data_s)
-                        target_s = torch.cat(all_target_s)
-                        self._training_iter(data_s, target_s, data_g, target_g)
-                        all_data_s, all_target_s = [], []
+            # validation on main net
+            val_loss, val_acc = self._eval(self.valid_loader, self.main_net, epoch=epoch, prefix='val')
 
-                # Update progress bar
+            if self.rank == 0:
+                log_acc(self.writer, epoch, val_acc, prefix='val/main')
+
+            # save best
+            if val_acc > self.best_val:
+                self.best_val = val_acc
                 if self.rank == 0:
-                    self.pbar.update(n=self.args.bs)
+                    self.logger.info('Saving best models...')
+                self.best_main_state = copy.deepcopy(self.main_net.state_dict())
+                self.best_meta_state = copy.deepcopy(self.meta_net.state_dict())
+                self.best_enhancer_state = copy.deepcopy(self.enhancer.state_dict())
 
-            # Per epoch evaluation
-            if self.rank == 0:
-                self.pbar.close()
-                self._epoch_evaluation()
-            dist.barrier()
-
-            self.main_schdlr.step()
-            self.meta_schdlr.step()
-            self.enhancer_schdlr.step()
-
-    def _epoch_evaluation(self):
-        ''' Evaluate epoch in terms of main/test val/test accuracy
-            Save best model if necessary '''
-        val_acc_main = evaluate(self.rank, self.main_net, self.valid_loader)
-        val_acc_meta = evaluate(self.rank, self.meta_net, self.valid_loader)
-        test_acc_main = evaluate(self.rank, self.main_net, self.test_loader)
-        test_acc_meta = evaluate(self.rank, self.meta_net, self.test_loader)
-
-        self.logger.info('Val acc: %.4f\tTest acc: %.4f' % (val_acc_main, test_acc_main))
-        self.writer.add_scalar('train/val_acc_main', val_acc_main, self.epoch)
-        self.writer.add_scalar('train/test_acc_main', test_acc_meta, self.epoch)
-        self.writer.add_scalar('train/val_acc_meta', val_acc_meta, self.epoch)
-        self.writer.add_scalar('test/test_acc_main', test_acc_main, self.epoch)
-            
-        if val_acc_main > self.best_val_main:
-            self.best_val_main = val_acc_main
-
-            self.best_main_params = copy.deepcopy(self.main_net.state_dict())
-            self.best_meta_params = copy.deepcopy(self.meta_net.state_dict())
-
-            self.logger.info('Saving best models...')
-            torch.save({
-                'epoch': self.epoch,
-                'best val main': self.best_val_main,
-                'main_net': self.best_main_params,
-                'meta_net': self.best_meta_params,
-            }, 'models/%s_best.pth' % self.exp_id)
-                
-        self.writer.add_scalar('train/val_acc_best', self.best_val_main, self.epoch)
-    
+    @torch.no_grad()
     def final_eval(self):
-        ''' Compute final test score '''
-        if self.rank == 0:   
-            self.main_net.load_state_dict(self.best_main_params)
-            self.meta_net.load_state_dict(self.best_meta_params)
+        if self.best_main_state is not None:
+            self.main_net.load_state_dict(self.best_main_state, strict=True)
 
-            test_acc_main = evaluate(self.rank, self.main_net, self.test_loader)
-
-            self.writer.add_scalar('test/acc', test_acc_main, self.args.steps)
-            self.logger.info('Test acc: %.4f' % test_acc_main)
-            return test_acc_main
+        test_loss, test_acc = self._eval(self.test_loader, self.main_net, epoch=None, prefix='test')
+        if self.rank == 0:
+            self.logger.info(f'[test] loss={test_loss:.4f}, acc={test_acc:.2f}')
+        return test_acc
